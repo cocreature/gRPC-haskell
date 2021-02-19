@@ -4,6 +4,9 @@
 
 module LowLevelTests.Op where
 
+import           Control.Concurrent
+import           Control.Exception
+import           Control.Monad
 import           Data.ByteString                (ByteString)
 import           Test.Tasty
 import           Test.Tasty.HUnit               as HU (testCase, (@?=))
@@ -47,14 +50,20 @@ withClientServerUnaryCall :: GRPC
 withClientServerUnaryCall grpc f = do
   withClient grpc clientConf $ \c -> do
     crm <- clientRegisterMethodNormal c "/foo"
-    withServer grpc serverConf $ \s ->
-      withClientCall c crm 10 $ \cc -> do
+    withServer grpc serverConf $ \s -> do
+      ccVar <- newEmptyMVar
+      bracket newEmptyMVar (\v -> putMVar v ()) $ \finished -> do
+        _ <- forkIO $ void $ withClientCall c crm 10 $ \cc -> do
+          putMVar ccVar cc
+          -- NOTE: We need to send client ops here or else `withServerCall` hangs,
+          -- because registered methods try to do recv ops immediately when
+          -- created. If later we want to send payloads or metadata, we'll need
+          -- to tweak this.
+          _clientRes <- runOps (unsafeCC cc) (clientCQ c) clientEmptySendOps
+          takeMVar finished
+          pure (Right ())
         let srm = head (normalMethods s)
-        -- NOTE: We need to send client ops here or else `withServerCall` hangs,
-        -- because registered methods try to do recv ops immediately when
-        -- created. If later we want to send payloads or metadata, we'll need
-        -- to tweak this.
-        _clientRes <- runOps (unsafeCC cc) (clientCQ c) clientEmptySendOps
+        cc <- takeMVar ccVar
         withServerCall s srm $ \sc ->
           f (c, s, cc, sc)
 
